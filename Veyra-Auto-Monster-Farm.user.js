@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - PvE Target Catalogue
 // @namespace    https://github.com/sideG1030/
-// @version      1.4.7
+// @version      1.4.8
 // @description  Auto-catalogues PvE monsters, predicts damage/stamina, and directly attacks all selected targets to their configured damage thresholds.
 // @homepageURL   https://github.com/sideG1030/Veyra-Auto-Monster-Farm
 // @updateURL     https://raw.githubusercontent.com/sideG1030/Veyra-Auto-Monster-Farm/main/Veyra-Auto-Monster-Farm.user.js
@@ -645,11 +645,33 @@
       }
 
       function parseStats(doc) {
-        const attack = int(doc.querySelector('#v-attack')?.textContent);
-        const defense = int(doc.querySelector('#v-defense')?.textContent);
-        const stamina = int(doc.querySelector('#v-stamina')?.textContent);
-        if (!attack && !defense && !stamina) throw new Error('Could not parse character stats.');
-        return { attack, defense, stamina };
+        // Current stats.php exposes the authoritative base attributes in a
+        // JSON state block. Prefer that over presentation markup so layout
+        // changes do not break the damage predictor again.
+        const stateEl = doc.querySelector('#stats-state[type="application/json"], #stats-state');
+        if (stateEl) {
+          try {
+            const state = JSON.parse(stateEl.textContent || '{}');
+            const attack = int(state?.user?.ATTACK ?? state?.core?.attack);
+            const defense = int(state?.user?.DEFENSE ?? state?.core?.defense);
+            const stamina = int(state?.user?.MAX_STAMINA ?? state?.core?.stamina);
+            if (attack || defense || stamina) return { attack, defense, stamina };
+          } catch (e) {
+            warn('Could not parse #stats-state JSON; falling back to visible stats.', e);
+          }
+        }
+
+        // Current visible-markup fallback.
+        const attack = int(doc.querySelector('[data-value="attack"]')?.textContent);
+        const defense = int(doc.querySelector('[data-value="defense"]')?.textContent);
+        const stamina = int(doc.querySelector('[data-value="stamina"]')?.textContent);
+
+        // Legacy fallback retained for older/cached page variants.
+        const legacyAttack = attack || int(doc.querySelector('#v-attack')?.textContent);
+        const legacyDefense = defense || int(doc.querySelector('#v-defense')?.textContent);
+        const legacyStamina = stamina || int(doc.querySelector('#v-stamina')?.textContent);
+        if (!legacyAttack && !legacyDefense && !legacyStamina) throw new Error('Could not parse character stats.');
+        return { attack: legacyAttack, defense: legacyDefense, stamina: legacyStamina };
       }
 
       function parseClass(doc) {
@@ -5666,10 +5688,29 @@
     }
 
     function inspectDivineBattleDoc(doc, battleUrl = '') {
-        if (!doc) return { isDivine: false, phase: 'normal', duelUrl: '', effectText: '' };
+        if (!doc) return { isDivine: false, phase: 'normal', duelUrl: '', effectText: '', hasPhase3Loot: false };
 
         const isDivine = !!doc.querySelector('.monster-frame.divine, .divine-badge');
-        if (!isDivine) return { isDivine: false, phase: 'normal', duelUrl: '', effectText: '' };
+        if (!isDivine) return { isDivine: false, phase: 'normal', duelUrl: '', effectText: '', hasPhase3Loot: false };
+
+        const bodyText = cleanText(doc.body?.innerText || '');
+        const effectText = cleanText(
+            doc.querySelector('.effect-text, .monster-effect, [class*="effect"]')?.textContent || bodyText
+        );
+
+        // A DIVINE badge by itself does NOT mean this monster has the special
+        // multi-phase flow. Some Divine monsters have only the ordinary PvE
+        // battle. Only opt into the skip -> duel -> final state machine when
+        // the battle page actually advertises Phase 3 loot.
+        const phase3LootSection = [...doc.querySelectorAll('.phase-loot-section')]
+            .find(section => /phase\s*3\s*loot/i.test(
+                cleanText(section.querySelector('.phase-loot-head')?.textContent || section.textContent || '')
+            ));
+        const hasPhase3Loot = !!phase3LootSection || /\bPhase\s*3\s*Loot\b/i.test(bodyText);
+
+        if (!hasPhase3Loot) {
+            return { isDivine: true, phase: 'normal', duelUrl: '', effectText, hasPhase3Loot: false };
+        }
 
         const duelLink = [...doc.querySelectorAll('a[href*="pvp_style_battle.php"]')]
             .find(a => {
@@ -5681,28 +5722,20 @@
             ? absoluteUrl(duelLink.getAttribute('href'), battleUrl || BASE_URL)
             : '';
 
-        const bodyText = cleanText(doc.body?.innerText || '');
-        const effectText = cleanText(
-            doc.querySelector('.effect-text, .monster-effect, [class*="effect"]')?.textContent || bodyText
-        );
-
-        // Final PvE must take priority over any stale/ambient duel wording
-        // that can remain elsewhere in the page after the phase duel is cleared.
-        // The live final-form page explicitly identifies itself as
-        // "Ascended PvE form", so treat that as authoritative.
+        // Positive final-form evidence takes priority over stale duel wording.
         if (/Ascended PvE form/i.test(bodyText)) {
-            return { isDivine: true, phase: 'final', duelUrl: '', effectText };
+            return { isDivine: true, phase: 'final', duelUrl: '', effectText, hasPhase3Loot: true };
         }
 
-        // Only an actual actionable monster-phase duel link identifies the
-        // duel state. Do not classify from generic "Duel Phase" page text.
+        // For a monster that really has Phase 3 loot, only the actual dynamic
+        // Enter Phase Duel link identifies the duel state.
         if (duelUrl) {
-            return { isDivine: true, phase: 'duel', duelUrl, effectText };
+            return { isDivine: true, phase: 'duel', duelUrl, effectText, hasPhase3Loot: true };
         }
 
-        // Any other Divine battle page is the initial PvE form. Never spend
-        // stamina here; the later PvE form's damage counts for the useful loot.
-        return { isDivine: true, phase: 'initial', duelUrl: '', effectText };
+        // Phase 3 loot exists, but neither the duel link nor the final form is
+        // available yet: this is the early PvE phase, so spend zero stamina.
+        return { isDivine: true, phase: 'initial', duelUrl: '', effectText, hasPhase3Loot: true };
     }
 
     async function readBattleDocument(battleUrl) {
@@ -7582,7 +7615,7 @@
         panel.innerHTML = `
             <div class="pve-main-header">
                 <div id="pve-title">
-                    ${minimized ? '🗺️ PvE · v1.4.7' : '🗺️ PvE Target Manager · v1.4.7'}
+                    ${minimized ? '🗺️ PvE · v1.4.8' : '🗺️ PvE Target Manager · v1.4.8'}
                 </div>
 
                 <button
@@ -7691,7 +7724,7 @@
             body.style.display = hidden ? 'none' : '';
             minimizeButton.textContent = hidden ? '+' : '−';
             minimizeButton.title = hidden ? 'Expand' : 'Minimize';
-            title.textContent = hidden ? '🗺️ PvE · v1.4.7' : '🗺️ PvE Target Manager · v1.4.7';
+            title.textContent = hidden ? '🗺️ PvE · v1.4.8' : '🗺️ PvE Target Manager · v1.4.8';
             panel.classList.toggle('pve-minimized', hidden);
         }
 
