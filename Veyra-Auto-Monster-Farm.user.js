@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - PvE Target Catalogue
 // @namespace    https://github.com/sideG1030/
-// @version      1.4.8
+// @version      1.4.11
 // @description  Auto-catalogues PvE monsters, predicts damage/stamina, and directly attacks all selected targets to their configured damage thresholds.
 // @homepageURL   https://github.com/sideG1030/Veyra-Auto-Monster-Farm
 // @updateURL     https://raw.githubusercontent.com/sideG1030/Veyra-Auto-Monster-Farm/main/Veyra-Auto-Monster-Farm.user.js
@@ -2773,7 +2773,27 @@
         const oldCatalogue = loadCatalogue();
         const cachedInfo = collectCachedMonsterInfo(oldCatalogue);
 
-        const catalogue = emptyCatalogue();
+        // Keep historical discoveries when a monster is not active today.
+        const catalogue = oldCatalogue;
+
+        // Clear transient dungeon routes before scanning, including if a scan fails.
+        for (const dungeon of Object.values(catalogue.dungeons || {})) {
+            for (const locationData of Object.values(dungeon.locations || {})) {
+                for (const monster of Object.values(locationData.monsters || {})) {
+                    monster.activeBattleUrl = '';
+                    monster.activeEncounters = [];
+                }
+            }
+        }
+
+        // Previously seen gate monsters are not presumed alive on refresh.
+        for (const gate of Object.values(catalogue.gates || {})) {
+            for (const section of Object.values(gate.sections || {})) {
+                for (const monster of Object.values(section.monsters || {})) {
+                    monster.currentlyAlive = null;
+                }
+            }
+        }
 
         // monsterKey -> one usable battle URL
         const battleRepresentatives = new Map();
@@ -4969,6 +4989,15 @@
                     // the same-origin iframe DOM, exactly as the older dungeon
                     // implementation did, rather than reconstructing its
                     // baseQS()/ep('JOIN') request or routing through postMessage.
+                    const directJoin = await directJoinInFrame(frame, item);
+                    if (directJoin.ok) {
+                        addLog(`${item.name}: direct dungeon join accepted; refreshing battle state once.`);
+                        frame.src = item.battleUrl;
+                        await waitForFrameLoad(frame, 12000);
+                        await sleep(180);
+                        continue;
+                    }
+                    addLog(`${item.name}: direct dungeon join unavailable/rejected (${directJoin.message || 'unknown'}); trying native join.`);
                     const ids = dungeonIdsFromBattleUrl(item.battleUrl);
                     const doc = frameDocument(frame);
                     const join = doc?.querySelector('#join-battle');
@@ -6374,6 +6403,24 @@
             };
         }
 
+        // Fast dungeon path: send the game's exact native attack payload
+        // directly, using the already-loaded battle frame's baseQS/ep/BCFG.
+        // No button click, DOM polling, or extra page reload per attack.
+        // Retain the native path only if the game helpers are unavailable.
+        if (frame) {
+            const direct = await directAttackInFrame(frame, slash);
+            if (!direct.unavailable) {
+                return {
+                    ok: direct.ok,
+                    status: direct.response?.status || 0,
+                    data: direct.data || { status: 'error', message: direct.message },
+                    raw: direct.raw || direct.message || '',
+                    nativeWorker: false,
+                    retryable: /slow down|cooldown|attacking too quickly/i.test(direct.message || '')
+                };
+            }
+        }
+
         // Dungeon battles: click the battle page's own native attack button.
         //
         // The uploaded dungeon page source shows that this click handler builds
@@ -6786,9 +6833,10 @@
                     );
 
                     addLog(
-                        `${item.name}: ${monsterIdFromBattleUrl(item.battleUrl) ? "direct" : "native dungeon"} ${slash.name} (${slash.cost} STAM).`
+                        `${item.name}: ${monsterIdFromBattleUrl(item.battleUrl) ? "direct" : "direct dungeon"} ${slash.name} (${slash.cost} STAM).`
                     );
 
+                    const attackStartedAt = performance.now();
                     const attackResult = await performDirectAttack(item, slash, frame);
                     const attackData = attackResult.data;
                     const message = cleanText(attackData?.message || attackResult.raw || '');
@@ -6864,7 +6912,8 @@
                         `${Math.round(item.targetDamage).toLocaleString('en-US')}.`
                     );
 
-                    await sleep(650);
+                    // Server response and bookkeeping count toward the attack interval.
+                    await sleep(Math.max(0, ATTACK_POST_CLICK_DELAY_MS - (performance.now() - attackStartedAt)));
                     state = loadAttackAutomation();
                     if (!state.active) return;
                     continue;
@@ -7041,6 +7090,7 @@
                     `${formatDamageCompact(remainingDamage)} damage remaining.`
                 );
 
+                const attackStartedAt = performance.now();
                 const data = await performBackgroundAttack(slash);
                 const message = cleanText(data?.message || '');
 
@@ -7109,7 +7159,9 @@
                     `${Math.round(afterDamage).toLocaleString('en-US')} / ${Math.round(item.targetDamage).toLocaleString('en-US')}.`
                 );
 
-                await sleep(ATTACK_POST_CLICK_DELAY_MS);
+                // Count the network request and all subsequent processing toward
+                // the 650 ms minimum start-to-start attack interval.
+                await sleep(Math.max(0, ATTACK_POST_CLICK_DELAY_MS - (performance.now() - attackStartedAt)));
             }
         } finally {
             attackLoopRunning = false;
@@ -7615,7 +7667,7 @@
         panel.innerHTML = `
             <div class="pve-main-header">
                 <div id="pve-title">
-                    ${minimized ? '🗺️ PvE · v1.4.8' : '🗺️ PvE Target Manager · v1.4.8'}
+                    ${minimized ? '🗺️ PvE · v1.4.11' : '🗺️ PvE Target Manager · v1.4.11'}
                 </div>
 
                 <button
@@ -7724,7 +7776,7 @@
             body.style.display = hidden ? 'none' : '';
             minimizeButton.textContent = hidden ? '+' : '−';
             minimizeButton.title = hidden ? 'Expand' : 'Minimize';
-            title.textContent = hidden ? '🗺️ PvE · v1.4.8' : '🗺️ PvE Target Manager · v1.4.8';
+            title.textContent = hidden ? '🗺️ PvE · v1.4.11' : '🗺️ PvE Target Manager · v1.4.11';
             panel.classList.toggle('pve-minimized', hidden);
         }
 
