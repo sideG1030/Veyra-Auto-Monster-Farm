@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - PvE Target Catalogue
 // @namespace    https://github.com/sideG1030/
-// @version      1.4.11
+// @version      1.4.13
 // @description  Auto-catalogues PvE monsters, predicts damage/stamina, and directly attacks all selected targets to their configured damage thresholds.
 // @homepageURL   https://github.com/sideG1030/Veyra-Auto-Monster-Farm
 // @updateURL     https://raw.githubusercontent.com/sideG1030/Veyra-Auto-Monster-Farm/main/Veyra-Auto-Monster-Farm.user.js
@@ -328,6 +328,52 @@
     let attackButton = null;
     let attackLoopRunning = false;
     let headlessBattleFrame = null;
+    // Recurring attack mode persists across page reloads.
+    const REPEAT_ATTACK_KEY = 'veyra_pve_repeat_attack_v1';
+    const REPEAT_ATTACK_INTERVAL_MS = 30 * 60 * 1000;
+    let repeatAttackStarting = false;
+    let repeatAttackTimer = null;
+
+    function loadRepeatAttack() {
+        try {
+            const value = JSON.parse(localStorage.getItem(REPEAT_ATTACK_KEY) || 'null');
+            return value && typeof value === 'object' ? value : { enabled: false, nextAt: 0 };
+        } catch { return { enabled: false, nextAt: 0 }; }
+    }
+
+    function saveRepeatAttack(value) {
+        localStorage.setItem(REPEAT_ATTACK_KEY, JSON.stringify(value));
+        const checkbox = document.getElementById('pve-repeat-attack');
+        if (checkbox) checkbox.checked = Boolean(value.enabled);
+    }
+
+    async function checkRepeatAttack() {
+        const repeat = loadRepeatAttack();
+        if (!repeat.enabled || repeatAttackStarting || scanning || attackLoopRunning || loadAttackAutomation().active) return;
+        if (Date.now() < (Number(repeat.nextAt) || 0)) return;
+        // Reserve the next slot before any asynchronous work; failed or empty
+        // scans must not cause rapid retries or duplicate attack sessions.
+        repeat.nextAt = Date.now() + REPEAT_ATTACK_INTERVAL_MS;
+        saveRepeatAttack(repeat);
+        repeatAttackStarting = true;
+        try {
+            addLog('Recurring autoattack: starting scheduled 30-minute run.');
+            await startAttackAutomation();
+        } catch (error) {
+            addLog(`Recurring autoattack start failed: ${error.message || error}`);
+        } finally {
+            repeatAttackStarting = false;
+        }
+    }
+
+    function initializeRepeatAttack() {
+        if (repeatAttackTimer !== null) return;
+        repeatAttackTimer = setInterval(() => {
+            checkRepeatAttack().catch(error => addLog(`Recurring autoattack error: ${error.message || error}`));
+        }, 15000);
+        checkRepeatAttack().catch(error => addLog(`Recurring autoattack error: ${error.message || error}`));
+    }
+
 
     /* ============================================================
        HELPERS
@@ -3937,7 +3983,36 @@
         return queue;
     }
 
-    function startAttackAutomation() {
+    async function startAttackAutomation() {
+        // Resolve live dungeon encounters when Attack is pressed. The catalogue
+        // stores monster identities and damage models, not permanent battle URLs.
+        // This is a lightweight dungeon-only refresh: gate and loot scans are
+        // intentionally not repeated before every attack session.
+        if (scanning) {
+            setStatus('A catalogue scan is already running; wait for it to finish.', true);
+            return;
+        }
+        scanning = true;
+        updateButtons();
+        try {
+            const catalogue = loadCatalogue();
+            const cachedInfo = collectCachedMonsterInfo(catalogue);
+            addLog('Resolving current dungeon encounters before attacking...');
+            await scanDungeons(catalogue, cachedInfo, new Map());
+            saveCatalogue(catalogue);
+            renderTargetManager();
+        } catch (error) {
+            // Do not silently attack stale dungeon instance IDs after a failed scan.
+            setStatus(`Cannot resolve live dungeon encounters: ${error.message}`, true);
+            addLog(`Dungeon encounter refresh failed: ${error.message}`);
+            return;
+        } finally {
+            scanning = false;
+            updateButtons();
+        }
+        // If the user disabled recurring mode during the asynchronous scan,
+        // don't start a new unattended session.
+        if (repeatAttackStarting && !loadRepeatAttack().enabled) return;
         const queue = selectedAttackQueue();
 
         if (!queue.length) {
@@ -7667,7 +7742,7 @@
         panel.innerHTML = `
             <div class="pve-main-header">
                 <div id="pve-title">
-                    ${minimized ? '🗺️ PvE · v1.4.11' : '🗺️ PvE Target Manager · v1.4.11'}
+                    ${minimized ? '🗺️ PvE · v1.4.12' : '🗺️ PvE Target Manager · v1.4.12'}
                 </div>
 
                 <button
@@ -7691,6 +7766,11 @@
                     >
                         ⚔ Attack Triton
                     </button>
+
+                    <label title="Automatically scan and attack selected targets every 30 minutes; requires this game tab to stay open." style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap;">
+                        <input id="pve-repeat-attack" type="checkbox" style="width:auto;" />
+                        Auto every 30 min
+                    </label>
 
                     <button
                         id="pve-refresh"
@@ -7745,6 +7825,17 @@
         refreshButton = panel.querySelector('#pve-refresh');
         attackButton = panel.querySelector('#pve-attack');
 
+        const repeatCheckbox = panel.querySelector('#pve-repeat-attack');
+        repeatCheckbox.checked = Boolean(loadRepeatAttack().enabled);
+        repeatCheckbox.addEventListener('change', () => {
+            const enabled = repeatCheckbox.checked;
+            saveRepeatAttack({ enabled, nextAt: enabled ? Date.now() : 0 });
+            addLog(enabled
+                ? 'Recurring autoattack enabled: starting now, then every 30 minutes while the tab is open.'
+                : 'Recurring autoattack disabled; any current attack session continues until stopped manually.');
+            if (enabled) checkRepeatAttack().catch(error => addLog(`Recurring autoattack error: ${error.message || error}`));
+        });
+
         attackButton.addEventListener('click', () => {
             const state = loadAttackAutomation();
 
@@ -7753,7 +7844,10 @@
                 return;
             }
 
-            startAttackAutomation();
+            startAttackAutomation().catch(error => {
+                setStatus(`Could not start autoattacks: ${error.message || error}`, true);
+                addLog(`Attack start failed: ${error.message || error}`);
+            });
         });
 
         refreshButton.addEventListener('click', () => {
@@ -7776,7 +7870,7 @@
             body.style.display = hidden ? 'none' : '';
             minimizeButton.textContent = hidden ? '+' : '−';
             minimizeButton.title = hidden ? 'Expand' : 'Minimize';
-            title.textContent = hidden ? '🗺️ PvE · v1.4.11' : '🗺️ PvE Target Manager · v1.4.11';
+            title.textContent = hidden ? '🗺️ PvE · v1.4.12' : '🗺️ PvE Target Manager · v1.4.12';
             panel.classList.toggle('pve-minimized', hidden);
         }
 
@@ -7796,6 +7890,7 @@
 
         // First run and later stale-cache refreshes both happen automatically.
         startAutomaticScan();
+        initializeRepeatAttack();
         const savedAttackState = loadAttackAutomation();
         if (savedAttackState.active) {
             addLog('Resuming saved multi-target attack queue.');
