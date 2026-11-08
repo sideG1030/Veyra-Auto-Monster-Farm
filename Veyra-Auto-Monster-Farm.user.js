@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra - PvE Target Catalogue
 // @namespace    https://github.com/sideG1030/
-// @version      1.4.13
+// @version      1.4.14
 // @description  Auto-catalogues PvE monsters, predicts damage/stamina, and directly attacks all selected targets to their configured damage thresholds.
 // @homepageURL   https://github.com/sideG1030/Veyra-Auto-Monster-Farm
 // @updateURL     https://raw.githubusercontent.com/sideG1030/Veyra-Auto-Monster-Farm/main/Veyra-Auto-Monster-Farm.user.js
@@ -5729,39 +5729,49 @@
     }
 
     async function ensureFramePlayerAlive(frame, item) {
-        let doc = frameDocument(frame);
-        const hp = getPlayerHpFromDoc(doc);
+        // Direct dungeon POST attacks do not run the game's browser-side
+        // retaliation/HP DOM updates. The iframe HP is therefore stale.
+        // Read the authoritative battle page before each next attack.
+        const battleUrl = item.battleUrl || frame?.src;
+        if (!battleUrl) {
+            throw new Error(`${item.name}: no dungeon battle URL for HP verification.`);
+        }
 
-        if (!Number.isFinite(Number(hp.current)) || Number(hp.current) > 0) {
+        const fresh = await readRegularBattleState(battleUrl);
+        const hp = fresh.playerHp;
+        if (!Number.isFinite(Number(hp?.current))) {
+            throw new Error(`${item.name}: cannot verify current HP from the live dungeon battle page; stopping to avoid attacking while dead.`);
+        }
+        if (Number(hp.current) > 0) {
+            // Keep the iframe's player HP display consistent with the server.
+            const hpText = frameDocument(frame)?.querySelector('#pHpText');
+            if (hpText) {
+                hpText.textContent = `${Math.round(Number(hp.current)).toLocaleString('en-US')} / ${Math.round(Number(hp.max)).toLocaleString('en-US')}`;
+            }
             return false;
         }
 
-        const potion = getHpPotionFromDoc(doc);
+        addLog(`${item.name}: live dungeon HP is 0; attempting Full HP Potion.`);
+        const potion = fresh.hpPotion;
         if (!potion) {
-            throw new Error(`${item.name}: player HP is 0 and no Full HP Potion is available.`);
+            throw new Error(`${item.name}: player HP is 0 and no Full HP Potion is available on the live battle page.`);
         }
 
         await useHpPotion(item, potion);
 
-        // Reload only the hidden battle frame so its HP/potion state is
-        // authoritative before the next attack. The visible page is untouched.
-        const loadPromise = waitForIframeLoad(frame);
-        frame.src = item.battleUrl;
-        await loadPromise;
-
-        doc = frameDocument(frame);
-        const refreshedHp = getPlayerHpFromDoc(doc);
-        if (
-            Number.isFinite(Number(refreshedHp.current)) &&
-            Number(refreshedHp.current) <= 0
-        ) {
-            throw new Error(`${item.name}: HP remained at 0 after using a Full HP Potion.`);
+        const verified = await readRegularBattleState(battleUrl);
+        if (!Number.isFinite(Number(verified.playerHp?.current)) ||
+            Number(verified.playerHp.current) <= 0) {
+            throw new Error(`${item.name}: HP recovery could not be verified after using a Full HP Potion.`);
         }
 
-        addLog(
-            `${item.name}: player recovered to ` +
-            `${Math.round(Number(refreshedHp.current) || 0).toLocaleString('en-US')} HP; resuming attack.`
-        );
+        // The iframe holds the native battle API/CSRF state. Reload it only
+        // after a successful heal, never on every routine HP check.
+        const loadPromise = waitForIframeLoad(frame);
+        frame.src = battleUrl;
+        await loadPromise;
+
+        addLog(`${item.name}: player recovered to ${Math.round(Number(verified.playerHp.current)).toLocaleString('en-US')} HP; resuming attack.`);
         return true;
     }
 
